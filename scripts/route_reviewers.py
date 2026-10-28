@@ -2,6 +2,7 @@
 """Decide which specialist reviewers a task needs, from the files it changed.
 
     python3 route_reviewers.py <repo> <base_sha> <branch> [--risk normal|high] [--since SHA]
+                               [--skip-below N]
 
 Prints one JSON object:
     {"reviewers": ["ui", "backend", "security"],   # only those that are needed
@@ -18,6 +19,10 @@ Rules (all deterministic, so the dispatcher spends no tokens on routing):
             or the added lines match a security pattern (SQL built by string
             concatenation, innerHTML, eval, shell execution, deserialization, ...)
   none      only documentation or trivial files changed, so no review is needed
+
+Small changes: with --skip-below N (the dispatcher passes 30 in review mode "auto"), a task
+that is not high risk, has no security trigger, and changed fewer than N lines gets no
+review at all. A binary file counts as 100 lines, so assets never slip through as "small".
 
 With --since, only the files changed since that commit are considered. The dispatcher
 uses it after a retry to re-run only the reviewers whose domain was touched.
@@ -107,7 +112,7 @@ def security_path_reasons(path):
     return out
 
 
-def route(files, added_text="", risk="normal"):
+def route(files, added_text="", risk="normal", lines=None, skip_below=0):
     groups = {"ui": [], "backend": [], "trivial": []}
     for f in files:
         groups[classify(f)].append(f)
@@ -137,9 +142,14 @@ def route(files, added_text="", risk="normal"):
         reasons["security"] = "; ".join(sec[:4])
     else:
         skipped["security"] = "no security trigger" if reviewed else "nothing to review"
-    if not reviewers:
+    if (reviewers and skip_below > 0 and lines is not None and lines < skip_below
+            and risk != "high" and not sec):
+        reviewers, reasons = [], {}
+        skipped = {"all": "small low-risk change: %d changed lines, under %d" % (lines, skip_below)}
+    if not reviewers and "all" not in skipped:
         skipped["all"] = "only documentation or trivial files changed" if files else "no files changed"
-    return {"reviewers": reviewers, "reasons": reasons, "skipped": skipped, "files": groups}
+    return {"reviewers": reviewers, "reasons": reasons, "skipped": skipped, "files": groups,
+            "lines": lines}
 
 
 def _git(repo, *args):
@@ -149,7 +159,18 @@ def _git(repo, *args):
     return p.stdout
 
 
-def compute(repo, base_sha, branch, risk="normal", since=None):
+def changed_lines(repo, rng, paths):
+    """Added plus deleted lines in `paths` over the range. A binary file counts as 100."""
+    if not paths:
+        return 0
+    total = 0
+    for row in _git(repo, "diff", "--numstat", rng, "--", *paths).splitlines():
+        a, d = (row.split("\t") + ["0", "0"])[:2]
+        total += 100 if a == "-" or d == "-" else int(a) + int(d)
+    return total
+
+
+def compute(repo, base_sha, branch, risk="normal", since=None, skip_below=0):
     """Route a task straight from git. Raises RuntimeError if git cannot answer."""
     rng = "%s..%s" % (since or base_sha, branch)
     files = [f for f in _git(repo, "diff", "--name-only", rng).splitlines() if f]
@@ -158,7 +179,7 @@ def compute(repo, base_sha, branch, risk="normal", since=None):
     if reviewed:
         diff = _git(repo, "diff", "-U0", rng, "--", *reviewed)
         added = "\n".join(l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
-    out = route(files, added, risk)
+    out = route(files, added, risk, changed_lines(repo, rng, reviewed), skip_below)
     out["range"] = rng
     return out
 
@@ -170,9 +191,11 @@ def main():
     ap.add_argument("branch")
     ap.add_argument("--risk", default="normal", choices=["normal", "high"])
     ap.add_argument("--since", help="only consider files changed since this commit")
+    ap.add_argument("--skip-below", type=int, default=0,
+                    help="skip review for a low-risk task that changed fewer than N lines (0 = never skip)")
     a = ap.parse_args()
     try:
-        print(json.dumps(compute(a.repo, a.base_sha, a.branch, a.risk, a.since)))
+        print(json.dumps(compute(a.repo, a.base_sha, a.branch, a.risk, a.since, a.skip_below)))
     except RuntimeError as e:
         sys.exit(str(e))
 

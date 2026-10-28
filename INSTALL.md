@@ -39,6 +39,8 @@ Check the exact rule syntax against the permissions docs for your Claude Code ve
 
     python3 .claude/skills/software-factory/scripts/selftest_eval.py
     python3 .claude/skills/software-factory/scripts/selftest_route.py
+    python3 .claude/skills/software-factory/scripts/selftest_integrate.py
+    python3 .claude/skills/software-factory/scripts/selftest_report.py
 
 It builds a synthetic run, confirms it scores 100, then breaks it in specific ways and confirms the right check catches each one. It needs only `python3` and `git`.
 
@@ -49,3 +51,14 @@ The factory never merges into your base branch, never offers to, and never pushe
 ## Reviewers
 
 Review is split into `factory-reviewer-ui`, `factory-reviewer-backend` and `factory-reviewer-security`. The dispatcher runs `scripts/route_reviewers.py` on each task's diff and spawns only the reviewers the changes need, in parallel: a backend-only change gets no UI reviewer, and a docs-only change gets none. The second self-test above checks the routing rules. The patterns live in that one script, so if the router spawns too much or too little for your codebase, tune it there (UI directories, security paths and patterns).
+
+## Keeping the token cost down
+
+Four changes cut the number of agent runs a task costs:
+
+- **Fewer, larger tasks.** The planner is told to merge tasks that edit the same files, to keep code, tests and small supporting changes together, and to avoid tasks under about 20 changed lines. It states why there are this many tasks, and the eval flags tasks that were tiny or sequenced only because they share files.
+- **Review is skipped for small, low-risk changes.** In review mode `auto` (the default), a task that is not high risk, has no security trigger and changed fewer than 30 lines gets no reviewer. Put `Review mode: always` in the request to review everything.
+- **Merging is a script.** `integrate.py` merges the verified branches in dependency order, runs your suite after each merge, and reverts a merge that breaks it. An agent runs only to resolve a conflict.
+- **The report is a script.** `make_report.py` writes `REPORT.md` from the artifacts. A reporter agent runs only if you ask for a summary.
+
+The suite command comes from the plan (a `Suite command:` line), which you approve at Gate 2, and the script runs it for you. It must be one plain command with no `;`, `&&`, `|`, `>` or backticks. If your suite needs several steps, put them in a build-tool task or a script in the repo and name that.

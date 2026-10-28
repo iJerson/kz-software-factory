@@ -34,6 +34,8 @@ DET_SHARE = 0.6
 AGENT_ORDER = ["dispatcher", "spec", "planner", "builder", "verifier",
                "reviewer", "integrator", "reporter"]
 
+MIN_TASK_LINES = 20  # a task that changed fewer lines than this was probably not worth its own agents
+SHELL_OPERATORS = re.compile(r"[;&|<>`$]")
 VALID_STATUS = {"ok", "needs-human", "failed"}
 FINDING_SEVERITIES = {"blocker", "should-fix", "nit"}
 FINDING_CATEGORIES = {"correctness", "security", "data-integrity", "maintainability",
@@ -45,7 +47,7 @@ REVIEW_DOMAIN = {"ui": {"ui", "accessibility", "correctness", "maintainability",
                  "security": {"security", "data-integrity"}}
 FAILURE_CLASSES = {"none", "spec-ambiguity", "test-failure", "env-error",
                    "wrong-approach", "scope-creep"}
-NON_AGENT = {"gate", "cleanup", "run_end", "tokens_correction", "eval", "discarded", "route"}
+NON_AGENT = {"gate", "cleanup", "run_end", "tokens_correction", "eval", "discarded", "route", "integrate"}
 GATE_NAME = re.compile(r"^GATE ([123]|blocked)$")
 GATE_STATUS = {"approved", "rejected", "waiting", "skipped"}
 TEST_PATH = re.compile(r"(^|/)tests?(/|$)|(^|/)test_|_test\.|\.test\.|Tests?\.[A-Za-z]+$")
@@ -75,7 +77,7 @@ RUBRIC = [
     ("R2", "reviewer", "major", True, "Severity is calibrated: blockers are real defects, and no obvious defect in the diff was missed."),
     ("R3", "reviewer", "minor", True, "Design adherence was checked when a DESIGN.md exists. Null if no design ran."),
     ("R4", "reviewer", "major", True, "The right specialist reviewers ran for this diff (ui, backend, security): none that was needed was skipped, none that the diff did not need was spawned, and each stayed in its own domain. Null for an older run with a single reviewer."),
-    ("I1", "integrator", "major", False, "Branches were merged in dependency order, the suite was run after each merge, any breaking merge was reverted, and the integrator did not fix code itself."),
+    ("I1", "integrator", "major", False, "Integration followed the script's rules (dependency order, the suite after each merge, breaking merges reverted), and if the integrator agent ran it only resolved the conflict it was given, without changing logic or tests."),
     ("REP1", "reporter", "critical", False, "Every acceptance criterion is reported with evidence. Nothing is marked met without evidence in the artifacts."),
     ("REP2", "reporter", "major", False, "Numbers (tasks, retries, tokens, findings) match the log and artifacts, and unknowns are stated as unknown."),
     ("DSP1", "dispatcher", "major", False, "The dispatcher held every gate, did not amend an approved artifact without asking the user, gave each agent only its listed inputs, and escalated blocked work instead of pushing through."),
@@ -184,7 +186,8 @@ def _col(header, *aliases, exact=False):
 
 def parse_tasks(text):
     header, rows = parse_table(text)
-    k = {"id": _col(header, "id", "task", exact=True), "deps": _col(header, "depends"),
+    k = {"id": _col(header, "id", "task", exact=True), "title": _col(header, "title", "name"),
+         "deps": _col(header, "depends"),
          "files": _col(header, "files"), "dod": _col(header, "definition", "dod"),
          "model": _col(header, "model"), "risk": _col(header, "risk"),
          "status": _col(header, "status")}
@@ -199,7 +202,8 @@ def parse_tasks(text):
         raw_files = r.get(k["files"], "") if k["files"] else ""
         files = [x.replace("`", "").strip(" ()") for x in re.split(r"\s*(?:,|;|\n|\band\b)\s*", raw_files)]
         files = [x for x in files if x and x not in ("-", "—", "none", "n/a")]
-        tasks.append({"id": tid, "deps": deps, "files": files,
+        tasks.append({"id": tid, "title": (r.get(k["title"], "") if k["title"] else "").replace("`", "").strip(),
+                      "deps": deps, "files": files,
                       "dod": r.get(k["dod"], "") if k["dod"] else "",
                       "model": (r.get(k["model"], "") if k["model"] else "").replace("`", "").strip().lower(),
                       "risk": (r.get(k["risk"], "") if k["risk"] else "").replace("`", "").strip().lower(),
@@ -327,6 +331,12 @@ def build_ctx(run_dir, repo):
         m = re.search(r"(\d+)\s*retries", c.text["INPUT.md"] or "")
         budget = int(m.group(1)) if m else 2
     c.budget = budget
+    try:
+        c.review_skip_below = int(((c.state.get("review") or {}).get("skip_below")) or 0)
+    except (TypeError, ValueError):
+        c.review_skip_below = 0
+    m = re.search(r"suite command\**\s*:\s*\**\s*`([^`]+)`", c.text["TASKS.md"] or "", re.I)
+    c.suite_command = m.group(1).strip() if m else None
     ran = set()
     for t in c.task_ids:
         if os.path.isdir(os.path.join(run_dir, "tasks", t)):
@@ -545,6 +555,20 @@ def check_plan(R, c):
                 clash.append("%s/%s share %s" % (a["id"], b["id"], ", ".join(sorted(shared))))
     R.add("plan.parallel.overlap", A, "major", not clash,
           "tasks that can run in parallel touch the same files: %s" % "; ".join(clash))
+    new_flow = "review" in c.state  # older runs predate the suite command line
+    R.add("plan.suite_command", A, "major",
+          None if not new_flow else (c.suite_command is not None and not SHELL_OPERATORS.search(c.suite_command)),
+          "TASKS.md has no 'Suite command: `...`' line" if c.suite_command is None else
+          "suite command %r contains shell operators; use one plain command" % c.suite_command)
+    merge = []
+    for i, a in enumerate(c.tasks):
+        for b in c.tasks[i + 1:]:
+            related = b["id"] in reach.get(a["id"], set()) or a["id"] in reach.get(b["id"], set())
+            shared = set(a["files"]) & set(b["files"])
+            if related and shared:
+                merge.append("%s and %s (share %s)" % (a["id"], b["id"], ", ".join(sorted(shared))))
+    R.add("plan.merge_candidates", A, "minor", not merge,
+          "tasks sequenced only because they edit the same files; merge them: %s" % "; ".join(merge))
     trace = section_text(t, "Traceability", ["Traceability", "Uncovered"])
     if c.criteria:
         missing = []
@@ -572,7 +596,7 @@ def check_tasks(R, c):
               "result.md missing", tid)
         have = sha and branch_exists(c.repo, branch)
         if not have:
-            for cid in ("build.commits", "build.scope", "build.no_test_deletion"):
+            for cid in ("build.commits", "build.scope", "build.no_test_deletion", "build.size"):
                 R.add(cid, "builder", "major", None, "branch %s not available" % branch, tid)
         else:
             rc, out = git(c.repo, "rev-list", "--count", "%s..%s" % (sha, branch))
@@ -599,6 +623,17 @@ def check_tasks(R, c):
                            and git(c.repo, "cat-file", "-e", "%s:%s" % (branch, f))[0] != 0})
             R.add("build.no_test_deletion", "builder", "critical", not gone,
                   "test files deleted: %s" % ", ".join(gone), tid)
+            try:
+                import route_reviewers
+                rng = "%s..%s" % (sha, branch)
+                files = [f for f in git(c.repo, "diff", "--name-only", rng)[1].splitlines() if f]
+                nontrivial = [f for f in files if route_reviewers.classify(f) != "trivial"]
+                lines = route_reviewers.changed_lines(c.repo, rng, nontrivial)
+                R.add("build.size", "builder", "minor", lines >= MIN_TASK_LINES,
+                      "%d changed lines in code files; under %d is too small to justify its own builder, "
+                      "verifier and reviewers" % (lines, MIN_TASK_LINES), tid)
+            except (ImportError, RuntimeError):
+                R.add("build.size", "builder", "minor", None, "size not available", tid)
 
         # --- verifier
         v, err = load_json(os.path.join(tdir, "verdict.json"))
@@ -613,7 +648,7 @@ def check_tasks(R, c):
                 # The verifier prompt asks for a stated reason on a skipped check, so
                 # "skipped (no linter configured)" counts as skipped.
                 clean = all(x == "pass" or str(x).startswith("skipped") for x in checks.values()) \
-                    and fc in ("none", None, "")
+                        and fc in ("none", None, "")
                 R.add("verify.consistent", "verifier", "critical", clean,
                       "verdict is pass but a check failed or the failure class is set", tid)
                 R.add("verify.done_ran", "verifier", "critical", checks.get("done") == "pass",
@@ -698,7 +733,8 @@ def check_reviews(R, c, tid, tdir, verdict, branch, byid):
                 import route_reviewers
                 risk = byid.get(tid, {}).get("risk") or "normal"
                 needed = set(route_reviewers.compute(c.repo, sha, branch,
-                                                     "high" if risk == "high" else "normal")["reviewers"])
+                                                     "high" if risk == "high" else "normal",
+                                                     skip_below=c.review_skip_below)["reviewers"])
             except (ImportError, RuntimeError):
                 needed = None
         if needed is None:
@@ -812,6 +848,8 @@ AGENT_FILE = {"dispatcher": ".claude/skills/software-factory/SKILL.md"}
 for _a in AGENT_ORDER[1:]:
     AGENT_FILE[_a] = ".claude/agents/factory-%s.md" % _a
 AGENT_FILE["reviewer"] = ".claude/agents/factory-reviewer-{ui,backend,security}.md"
+AGENT_FILE["integrator"] = ".claude/skills/software-factory/scripts/integrate.py"
+AGENT_FILE["reporter"] = ".claude/skills/software-factory/scripts/make_report.py"
 
 # check id -> (what to do about this run, what to change in the factory so it does not recur).
 # Placeholders: {tasks} {detail} {run_id} {slug} {base} {base_sha} {branch}
@@ -890,6 +928,10 @@ ACTIONS = {
                               "factory-planner (plan mode): tasks that touch the same files must be sequenced."),
     "plan.traceability": ("Map every acceptance criterion to a task in the Traceability section ({detail}).",
                           "factory-planner (plan mode): every criterion must map to at least one task."),
+    "plan.suite_command": ("Add the suite command to TASKS.md: the one command that runs the project's full test suite, with no shell operators ({detail}).",
+                           "factory-planner (plan mode): always write a Suite command line; the integration script runs it after every merge."),
+    "plan.merge_candidates": ("Consider merging these tasks into one before building: {detail}.",
+                              "factory-planner (plan mode): merge tasks that edit the same files instead of sequencing them."),
     "plan.design_refs": ("Name the design interfaces each task implements in TASKS.md.",
                          "factory-planner (plan mode): refer to interface ids in tasks when a design exists."),
     "build.result": ("Re-run the builder for {tasks}, or write result.md from its commits.",
@@ -898,6 +940,8 @@ ACTIONS = {
                       "factory-builder: commit your work to the task branch."),
     "build.scope": ("Review the files outside the task's scope before merging ({detail}).",
                     "factory-builder: stay inside the task's files; report needs-human instead of widening scope."),
+    "build.size": ("Task {tasks} was tiny ({detail}). Next time fold it into a neighbouring task.",
+                   "factory-planner (plan mode): avoid tasks under about 20 changed lines; each task costs a builder, a verifier and its reviewers."),
     "build.no_test_deletion": ("Restore the deleted tests on the branch for {tasks}: git checkout {base_sha} -- <file>, then commit. ({detail})",
                                "factory-builder: never delete or weaken tests to get a pass."),
     "verify.artifact": ("Re-run the verifier for {tasks}.", "factory-verifier: write verdict.json with every required key."),
@@ -928,19 +972,20 @@ ACTIONS = {
                               "Phase 4b: run route_reviewers.py and spawn every reviewer it returns; do not override it with your own judgement."),
     "review.routing.extra": (None,
                              "Phase 4b: do not spawn a reviewer the router did not return. If the router is wrong for your codebase, tune the patterns in scripts/route_reviewers.py."),
-    "integ.artifact": ("Re-run the integrator, or write integration.md from the merge log.",
-                       "factory-integrator: always write integration.md."),
-    "integ.suite": ("Run the full suite on the feature branch and record the result in integration.md.",
-                    "factory-integrator: end integration.md with the final suite result."),
-    "report.exists": ("Re-run the reporter, or write REPORT.md from the artifacts.",
-                      "factory-reporter: return the report text if the write is denied."),
-    "report.sections": ("Add the missing report sections ({detail}).", "factory-reporter: write all seven sections every time."),
-    "report.criteria": ("Add the missing acceptance criteria to REPORT.md ({detail}).",
-                        "factory-reporter: one row per acceptance criterion."),
-    "report.cost.unknowns": ("Add a line saying which agent runs have no token figure.",
-                             "factory-reporter: state unknown token figures instead of hiding them."),
-    "report.cost.own": ("Add a line saying the reporter's own cost is not in the log.",
-                        "factory-reporter: say that its own cost is excluded."),
+    "integ.artifact": ("Run integrate.py again; it rewrites integration.md.",
+                       "integrate.py: write integration.md on every run."),
+    "integ.suite": ("Run integrate.py again so the final suite result is recorded.",
+                    "integrate.py: end integration.md with the final suite result."),
+    "report.exists": ("Run make_report.py to regenerate REPORT.md.",
+                      "make_report.py: always write REPORT.md."),
+    "report.sections": ("Run make_report.py to regenerate REPORT.md; it writes every section ({detail}).",
+                        "make_report.py: write all seven sections every time."),
+    "report.criteria": ("Run make_report.py to regenerate REPORT.md ({detail}).",
+                        "make_report.py: one row per acceptance criterion."),
+    "report.cost.unknowns": ("Run make_report.py to regenerate REPORT.md; it states unknown token figures.",
+                             "make_report.py: state unknown token figures instead of hiding them."),
+    "report.cost.own": ("Run make_report.py to regenerate REPORT.md.",
+                        "make_report.py: say that no reporter cost was incurred."),
 }
 
 

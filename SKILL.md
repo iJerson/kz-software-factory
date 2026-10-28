@@ -21,8 +21,8 @@ Each phase is its own subagent (definitions in `agents/`, copied to `.claude/age
 | 3 Build | `factory-builder` (one per task, parallel) | per task | code on its own branch, `tasks/<id>/result.md` |
 | 4 Verify | `factory-verifier` (one per task, never the builder) | sonnet | `tasks/<id>/verdict.json` |
 | 4b Review | `factory-reviewer-ui`, `factory-reviewer-backend`, `factory-reviewer-security`: only the ones the task's changes need, in parallel | sonnet; opus for backend and security when risk is high | `tasks/<id>/review.<kind>.json` |
-| 5 Integrate | `factory-integrator` | sonnet | `integration.md` |
-| 6 Report | `factory-reporter` | haiku | REPORT.md |
+| 5 Integrate | `scripts/integrate.py` (no agent); `factory-integrator` only to resolve a conflict | sonnet | `integration.md` |
+| 6 Report | `scripts/make_report.py` (no agent); `factory-reporter` only if the user asks for a summary | haiku | REPORT.md |
 | 7 Learn (only if asked) | `factory-learner` | sonnet | `.factory/proposals/*.md` |
 | 8 Eval (on by default) | `scripts/factory_eval.py`, then `factory-evaluator` | sonnet | `eval.json`, `EVAL.md`, `eval_judge.json` |
 
@@ -64,9 +64,10 @@ The dispatcher is the only writer of `agent_log.jsonl`. This avoids parallel wri
 - Fields: `ts, run, task, agent, model, event, status, retries, tokens`.
 - `tokens`: use the usage figure the spawn result reports for that agent. If the result does not report one, write `null`. **Never write 0 for an unknown count**; a zero would be read as a real measurement. Agents do not report their own tokens. If the result reports usage in parts (input, output, cache read, cache creation), also record those parts verbatim under `usage`. Do not add them up yourself or invent a figure: the total the harness reports may count cached input differently from the usage view, and the parts let the number be reinterpreted later.
 - **Late usage figures.** If a figure arrives after the return line was written, do not edit that line (the log is append-only). Append `{"ts", "run", "event": "tokens_correction", "agent", "task", "mode", "retries", "tokens"}` with the same `agent`, `task`, `mode` and `retries` as the return it belongs to. Always include `mode` on planner lines and `retries` on retried tasks, so the match is unambiguous. A correction is not a new agent run.
-- **Event names.** Use exactly these: `return` (an agent finished), `tokens_correction`, `gate`, `discarded`, `route`, `cleanup`, `eval`, `run_end`.
+- **Event names.** Use exactly these: `return` (an agent finished), `tokens_correction`, `gate`, `discarded`, `route`, `integrate`, `cleanup`, `eval`, `run_end`.
 - **Gate events.** One line per gate decision, with exactly these fields: `{"ts", "run", "event": "gate", "gate": "GATE 1" | "GATE 2" | "GATE 3" | "GATE blocked", "status": "approved" | "rejected" | "waiting" | "skipped", "note": "<what the user said or decided>"}`. Do not invent gate names (no `GATE 1/2`) and do not put the status under another field name (not `decision`). If one user message answers two gates, or answers a gate and changes a setting, log one event per decision.
 - **Route events.** Before spawning reviewers, append `{"ts", "run", "event": "route", "task", "retries", "reviewers": [...], "reasons": {...}, "skipped": {...}}` with the router's answer. On each reviewer's `return` line, include `blockers` (the number of blocker findings it reported).
+- **Integrate events.** After each run of `integrate.py`, append `{"ts", "run", "event": "integrate", "status", "merged": [...], "conflicts": [...], "summary"}` with the script's output. The script is not an agent and has no token cost.
 - **Discarded runs.** If an agent's output is thrown away, for example because the user skips design while the design agent is running, append `{"ts", "run", "event": "discarded", "agent", "task", "mode", "retries", "reason"}`, matched to its return the same way a token correction is. That is how wasted tokens get reported.
 - After the final step, append a `run_end` line with `tokens_known_total` (each agent run's figure counted once, whether it came inline or from a correction) and `agents_without_tokens` (how many agent runs still have no figure). Tell the user that the known total undercounts, and ask once for the session total from Claude Code's usage view. If they give it, record it as `tokens_session_total` on the `run_end` line, as a plain integer such as `104000` (not text like "104k", and not an object). The reporter's own cost is never in the log it reads, so say so in the report.
 
@@ -87,6 +88,7 @@ The log says what happened. `STATE.json` says where the run is, so a run can be 
   "gate": {"name": "GATE 2", "status": "waiting|approved|rejected|none"},
   "design_ran": true,
   "budget": {"retries": 2, "parallel": 3},
+  "review": {"mode": "auto", "skip_below": 30},
   "integration": {"branch": "feature/<slug>", "worktree": ".factory/worktrees/<slug>", "status": "pending|merged|failed"},
   "tasks": {
     "T1": {"status": "pending|ready|building|verifying|reviewing|verified|blocked|skipped|integration-failed",
@@ -111,7 +113,7 @@ Invoked as `/software-factory resume [run-id]`. With no run-id, list the runs un
    - A task or phase is marked in flight with no return logged (the session died mid-agent). Treat it as interrupted, not failed, and do not charge a retry:
      - builder: if the worktree has commits ahead of base, send the task to verify; otherwise rebuild it.
      - verifier or reviewer: re-run it (for reviewers, only those with no review file yet). They are read-only, so this is safe.
-     - integrator: check the integration branch and `integration.md`. If merges are partly done, re-spawn it to continue from that point; if the state is unclear, ask.
+     - integration: run `integrate.py` again. It is safe to re-run: it skips branches that are already merged. If a conflict was being resolved, check that the worktree is clean (no merge in progress) first; if the state is unclear, ask.
    - An artifact exists on disk but the state is behind it: show it to the user and ask whether to accept it.
 3. If `STATE.json` is missing or unreadable but the run directory exists, rebuild a best-effort state from the log and the artifacts, show the reconstruction, and ask the user to confirm it.
 4. Summarize: phase, open gate, task table, what was interrupted, and what you propose to do next. **Wait for confirmation before spawning anything.** Subagents cannot be resumed; a fresh agent is spawned from the artifacts on disk.
@@ -128,6 +130,7 @@ Take the request from the invocation text. If any of these are missing, ask once
 6. Design mode (optional): `always` (default), `auto`, or `never`. See Gate 1.
 7. Eval mode (optional): `full` (default: scripted checks plus the judge agent), `fast` (scripted checks only, no extra tokens), or `off`. See Phase 8.
 8. Integration branch name (optional): default `feature/<slug>`.
+9. Review mode (optional): `auto` (default: skip review for a task that is not high risk, has no security trigger and changed fewer than 30 lines) or `always`. See Phase 4b.
 
 Preflight checks, before creating anything. If a hard check fails, stop and tell the user. Never stash, checkout, reset, or commit on the user's behalf without asking.
 
@@ -168,7 +171,7 @@ Run the planner twice, back to back, then hold a single gate over both outputs.
 
 **When design is skipped** (mode `never`, or `auto` and the spec is small): do not spawn the planner in design mode, and **create no design file of any kind**: no `DESIGN.md`, no `DESIGN.skipped.md`, no empty or placeholder file. A file saying design was skipped costs tokens and means nothing. Record the skip only in `STATE.json` (`design_ran: false`) and in the note on the Gate 1 log event. Pass later agents no design path and do not mention a design to them.
 
-**GATE 2:** show DESIGN.md (if it ran) and TASKS.md together, leading with the design's key decisions and the task list. Wait for approval. The user may edit either file first; re-read both before continuing. If the user rejects the design, restart from step 1 with their feedback; the plan is discarded and rebuilt. If they reject only the plan, re-run step 2 with their feedback.
+**GATE 2:** show DESIGN.md (if it ran) and TASKS.md together, leading with the design's key decisions and the task list. Show the **suite command** (the `Suite command:` line) on its own line and say that it will be run after every merge; the user's approval covers it. Show the **Sizing** note too, and if the plan has several tiny tasks, say so. Wait for approval. The user may edit either file first; re-read both before continuing. If the user rejects the design, restart from step 1 with their feedback; the plan is discarded and rebuilt. If they reject only the plan, re-run step 2 with their feedback.
 
 ### Phase 3: Build
 For each ready task (dependencies verified), up to the parallel limit:
@@ -185,7 +188,7 @@ When a builder returns, spawn a fresh `factory-verifier` on that task's branch. 
 ### Phase 4b: Review
 Only tasks that passed verification are reviewed. There are three specialist reviewers: `factory-reviewer-ui`, `factory-reviewer-backend` and `factory-reviewer-security`. **Spawn only the ones the task's changes need**, and run them in parallel.
 
-1. **Route.** Run `python3 .claude/skills/software-factory/scripts/route_reviewers.py <repo> <base_sha> factory/<run-id>/<task-id> --risk <normal|high>`, taking the risk from the task row. It is deterministic and costs no tokens. It returns the reviewers needed, the files in each domain, and why each was or was not needed. Do not override it with your own judgement. If it returns no reviewers (only documentation or trivial files changed), mark the task `verified` with no review.
+1. **Route.** Run `python3 .claude/skills/software-factory/scripts/route_reviewers.py <repo> <base_sha> factory/<run-id>/<task-id> --risk <normal|high> [--skip-below 30]`, taking the risk from the task row, and adding `--skip-below 30` unless the review mode is `always`. It is deterministic and costs no tokens. It returns the reviewers needed, the files in each domain, and why each was or was not needed. Do not override it with your own judgement. If it returns no reviewers (only documentation or trivial files changed, or a small low-risk change), mark the task `verified` with no review, and still log the route event so the skip is on record.
 2. **Log the route.** Append a `route` event before spawning (see Log).
 3. **Spawn in parallel.** Spawn all of the routed reviewers for the task in a single message, so they run at the same time. A task's reviewers always run together, even if that exceeds the parallel limit; the limit applies across tasks. Give each one: the task row (including its risk level), SPEC.md, the DESIGN.md path only if design ran, the branch, the base branch, and the files the router assigned to its domain. Give the security reviewer the router's reason for spawning it. Use sonnet for all of them, and override `backend` and `security` to opus when the task's risk is `high` (leave `ui` on sonnet). Each writes `tasks/<id>/review.<kind>.json`. Record the branch tip at this moment as `reviewed_sha` in `STATE.json`.
 4. **Decide once every routed reviewer has returned.**
@@ -199,10 +202,18 @@ Only tasks that passed verification are reviewed. There are three specialist rev
 Phases 3, 4, and 4b repeat until every task is `verified`, `skipped`, or the run is aborted.
 
 ### Phase 5: Integrate
-Create the integration worktree and branch, named after the feature (see Naming): `git worktree add .factory/worktrees/<slug> -b feature/<slug> <base_branch>`, and record both in `STATE.json`. Spawn `factory-integrator` with the integration worktree path, the branch name, and the verified branches in dependency order. It merges one at a time **inside that worktree**, re-runs the full suite after each merge, and reverts any merge that breaks it. Failures return as `needs-human` and become a gate like the one above. It never touches the base branch or the user's working directory.
+Create the integration worktree and branch, named after the feature (see Naming): `git worktree add .factory/worktrees/<slug> -b feature/<slug> <base_branch>`, and record both in `STATE.json`. Merging is done by a script, not an agent:
+
+1. Run `python3 .claude/skills/software-factory/scripts/integrate.py <run-dir>`. It merges the verified task branches in dependency order inside the integration worktree, runs the **suite command from TASKS.md** (the one the user approved at Gate 2) after each merge, reverts any merge that breaks it, and runs the suite once more on the final commit. It never touches the base branch or your working directory, and costs no tokens. It prints a JSON result; log it as an `integrate` event.
+2. `status: ok`: continue to Phase 5b.
+3. **A conflict** (`conflicts` is not empty): the script has aborted that merge and stopped, leaving the worktree clean. Spawn `factory-integrator` for that one conflict, giving it the worktree, the branch, the task, its branch, the conflicting files, and the suite command. When it returns `ok`, run the script again: it recognises the resolved merge and carries on. If the agent returns `needs-human`, or the conflict comes back, hold a gate (see below).
+4. **A suite failure** (`suite_failed` is not empty): the script has already reverted that merge. Do not try to fix the code. Tasks that depend on it are listed as skipped. Hold a gate.
+5. If the script returns `failed` (for example, no suite command, or a command with shell operators), stop and tell the user what to fix; do not invent a command.
+
+**GATE (on integration problems):** show the conflict or the failing task and the script's summary. The user decides: edit the task, skip it, resolve it themselves, or abort.
 
 ### Phase 5b: Clean up task worktrees
-The dispatcher does this itself, right after the integrator returns (and also when a run is blocked or aborted); do not leave it to an agent. It removes the **task** worktrees only. **The integration worktree stays.** It is the workspace for reviewing the result or opening a PR, and it is dealt with at Finish. On an abort, remove it as well.
+The dispatcher does this itself, right after integration finishes (and also when a run is blocked or aborted); do not leave it to an agent. It removes the **task** worktrees only. **The integration worktree stays.** It is the workspace for reviewing the result or opening a PR, and it is dealt with at Finish. On an abort, remove it as well.
 
 1. For every worktree under `.factory/worktrees/<run-id>/`, check for uncommitted changes. If there are any, do not force-remove it: list them and ask the user.
 2. Otherwise remove it: `git worktree remove <path>`. Then `git worktree prune`, and delete `.factory/worktrees/<run-id>/` if it is empty.
@@ -210,9 +221,9 @@ The dispatcher does this itself, right after the integrator returns (and also wh
 4. Update `STATE.json` and log the cleanup (which task worktrees were removed, and that the integration worktree was kept).
 
 ### Phase 6: Report
-Spawn `factory-reporter`. It writes REPORT.md: acceptance criteria met or not with evidence, tasks by outcome, retries used, tokens by model, integration branch, and follow-ups. Pass it the `agent_log.jsonl` for cost numbers. It also reads every `review.*.json` (and a legacy `review.json`, if an older run has one) so the remaining should-fix and nit findings reach you.
+Run `python3 .claude/skills/software-factory/scripts/make_report.py <run-dir>`. It writes REPORT.md from the artifacts, with no agent: each acceptance criterion's result and evidence (from the traceability section, each task's state and the final suite), the task table with the lines each task changed, review findings by reviewer, integration, cost by model, and follow-ups. Nothing in it is estimated, and it states unknown token figures as unknown. Verify that the file exists before moving on.
 
-If the reporter returns `write denied` with the report text in its reply, write `REPORT.md` yourself from that text, then continue. Verify that the file exists before moving on.
+Only if the user asks for a plain-language summary, spawn `factory-reporter`. It reads REPORT.md only and adds a short `## Summary` section; it changes nothing else.
 
 ### Gate 3: the final decision
 

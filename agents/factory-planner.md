@@ -52,6 +52,10 @@ Write `TASKS.md` in the run directory as a table:
 - **risk**: `high` for tasks touching money handling, authentication or authorization, data migrations, security-sensitive code, or shared infrastructure; `normal` for everything else. High-risk tasks get a deeper code review on a stronger model.
 - **status**: `ready` if it has no unmet dependencies, else `pending`.
 
+Directly under the table, add two lines:
+- ``Suite command: `<command>` `` is the single command that runs the project's full test suite (for example `./gradlew test`, `python -m unittest`, `npm test`). It must be one plain command with no `;`, `&&`, `|`, `>`, backticks or `$`; if the suite needs several steps, point to a build-tool task or a script in the repo. The user approves it at the gate, and the integration script runs it after every merge.
+- `Sizing: <one sentence>` says why there are this many tasks.
+
 When design ran, also:
 - Split work along the design's interface boundaries, so tasks can be built in parallel against the agreed contracts.
 - Name the interface ids (`I1`, ...) each task implements or consumes in its title or definition of done, so builders and reviewers can check against `DESIGN.md`.
@@ -60,10 +64,17 @@ When design ran, also:
 Also add a short **Traceability** section mapping each acceptance criterion in SPEC.md to the task ids that satisfy it.
 
 ### Rules
-- Each task must fit one builder context: small, single purpose.
+- Each task must fit one builder context and have one purpose. **Prefer fewer, larger tasks** (see Sizing below).
 - Tasks that touch the same files must be sequenced with `depends_on`, not left parallel.
 - Every acceptance criterion must map to at least one task. If one cannot be covered, say so under an **Uncovered** heading and return `needs-human`.
 - Do not write code or modify anything except TASKS.md. In plan mode, never create `DESIGN.md` or any design placeholder.
+
+### Sizing: fewer, larger tasks
+Every task costs a builder, a verifier and one to three reviewers, so every extra task costs real tokens. Plan the fewest tasks that still let independent parts be built in parallel.
+- Merge tasks that edit the same files into one task. Do not sequence two tasks just because they touch the same file.
+- Keep code, its tests and its small supporting changes (config, docs, ignore files, wiring) in the same task. Never make a task for a `.gitignore`, a README or a one-line change.
+- Aim for each task to change at least about 20 lines and to be something a person could review on its own. A single-module feature is usually one to three tasks.
+- Split only when the parts are independent (different files and no shared interface), or when one part must land first because the others build on its interface.
 
 ### Reply format
 End with one line of JSON and nothing after it:

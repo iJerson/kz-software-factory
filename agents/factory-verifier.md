@@ -28,7 +28,7 @@ Write `tasks/<task-id>/verdict.json` in the run directory:
   "task": "T1",
   "result": "pass | fail",
   "failure_class": "none | spec-ambiguity | test-failure | env-error | wrong-approach | scope-creep",
-  "checks": {"build": "pass|fail|skipped", "tests": "...", "lint": "...", "done": "...", "scope_and_tests": "..."},
+  "checks": {"build": "pass | fail | skipped (reason)", "tests": "...", "lint": "...", "done": "...", "scope_and_tests": "..."},
   "evidence": "commands run and the relevant output, trimmed",
   "fix_hint": "what the next builder should change, specifically"
 }

@@ -94,6 +94,8 @@ TASKS = """# Tasks
 | T2 | Add b (I2) | - | `app/b.py`, `tests/test_b.py` | `python -m unittest tests.test_b` passes | sonnet | high | verified |
 | T3 | Add suite | T1, T2 | `tests/test_all.py` | `python -m unittest` passes | haiku | normal | verified |
 
+Suite command: `python3 suite.py`
+
 ## Traceability
 - 1 -> T1
 - 2 -> T2
@@ -216,9 +218,12 @@ def build(tmp, legacy=False):
     sh(repo, "config", "user.name", "tester")
     sh(repo, "commit", "-q", "--allow-empty", "-m", "base")
     base = sh(repo, "rev-parse", "HEAD")
-    files = {"T1": {"app/a.py": "a = 1\n"},
-             "T2": {"app/b.py": "b = 1\n", "tests/test_b.py": "def test():\n    pass\n"},
-             "T3": {"tests/test_all.py": "def test():\n    pass\n"}}
+    def code(prefix, n):
+        return "".join("%s%d = %d\n" % (prefix, i, i) for i in range(n))
+
+    files = {"T1": {"app/a.py": code("a", 40)},
+             "T2": {"app/b.py": code("b", 40), "tests/test_b.py": "def test():\n    pass\n"},
+             "T3": {"tests/test_all.py": "".join("def test_%d():\n    pass\n" % i for i in range(20))}}
     for t, fl in files.items():
         sh(repo, "checkout", "-q", "-b", "factory/%s/%s" % (RUN, t), base)
         for p, txt in fl.items():
@@ -243,6 +248,7 @@ def build(tmp, legacy=False):
     state = {"run": RUN, "slug": SLUG, "repo": repo, "base_branch": "main", "base_sha": base, "phase": "eval",
              "gate": {"name": "GATE 3", "status": "approved"}, "design_ran": True,
              "budget": {"retries": 2, "parallel": 3},
+             "review": {"mode": "auto", "skip_below": 30},
              "integration": {"branch": INTEG, "worktree": ".factory/worktrees/%s" % SLUG, "status": "merged"},
              "tasks": {"T1": {"status": "verified", "retries": 0},
                        "T2": {"status": "verified", "retries": 1},
@@ -516,6 +522,56 @@ def m_route_not_logged(repo, rd, base):
     return "review.routing.logged"
 
 
+def m_no_suite_command(repo, rd, base):
+    edit(rd, "TASKS.md", "Suite command: `python3 suite.py`\n", "")
+    return "plan.suite_command"
+
+
+def m_suite_shell_operator(repo, rd, base):
+    edit(rd, "TASKS.md", "`python3 suite.py`", "`make build && make test`")
+    return "plan.suite_command"
+
+
+def m_merge_candidates(repo, rd, base):
+    # T2 now edits T1's file and waits for it: two tasks that should have been one
+    edit(rd, "TASKS.md", "| T2 | Add b (I2) | - | `app/b.py`, `tests/test_b.py` |",
+         "| T2 | Add b (I2) | T1 | `app/a.py`, `app/b.py`, `tests/test_b.py` |")
+    return "plan.merge_candidates"
+
+
+def m_tiny_task(repo, rd, base):
+    br = "factory/%s/T1" % RUN
+    sh(repo, "checkout", "-q", br)
+    sh(repo, "reset", "-q", "--hard", base)
+    put(os.path.join(repo, "app", "a.py"), "a0 = 0\na1 = 1\na2 = 2\n")
+    sh(repo, "add", "app/a.py")
+    sh(repo, "commit", "-q", "-m", "tiny")
+    sh(repo, "checkout", "-q", "main")
+    return "build.size"
+
+
+def m_small_task_reviewed(repo, rd, base):
+    # with a high skip threshold T1 and T3 count as small and low risk, yet they were reviewed
+    edit_json(rd, "STATE.json", lambda d: d["review"].update(skip_below=1000))
+    return "review.routing.extra"
+
+
+def skip_small_reviews(rd):
+    """A healthy run in which T1 and T3 are small and low risk, so they were not reviewed."""
+    edit_json(rd, "STATE.json", lambda d: d["review"].update(skip_below=1000))
+
+    def fn(e):
+        if e.get("event") == "route" and e.get("task") in ("T1", "T3"):
+            e["reviewers"], e["reasons"] = [], {}
+            e["skipped"] = {"all": "small low-risk change"}
+        if str(e.get("agent", "")).startswith("factory-reviewer") and e.get("task") in ("T1", "T3"):
+            return []
+        return [e]
+    _rewrite_log(rd, fn)
+    for t in ("T1", "T3"):
+        os.remove(os.path.join(rd, "tasks", t, "review.backend.json"))
+
+
 def m_generic_name(repo, rd, base):
     edit_json(rd, "STATE.json", lambda d: d["integration"].update(branch="factory/%s/integration" % RUN))
     return "dsp.naming"
@@ -539,7 +595,9 @@ MUTATIONS = [m_no_gate2, m_pass_with_failed_check, m_done_skipped, m_test_delete
              m_generic_name, m_worktree_left_after_apply, m_worktree_missing_after_leave,
              m_unrequested_merge, m_merge_no_decision,
              m_ui_reviewer_missing, m_unneeded_ui_reviewer, m_reviewer_not_routed,
-             m_review_file_missing, m_review_domain, m_route_not_logged]
+             m_review_file_missing, m_review_domain, m_route_not_logged,
+             m_no_suite_command, m_suite_shell_operator, m_merge_candidates, m_tiny_task,
+             m_small_task_reviewed]
 
 
 def failed_ids(result):
@@ -585,6 +643,22 @@ def main():
                % failed_ids(r))
         expect(any(c["id"] == "design.ran" and c["result"] == "na" for c in r["checks"]),
                "design checks are not applicable, not failed")
+
+        print("small low-risk tasks skip review")
+        repo, rd, base = build(os.path.join(tmp, "smallskip"))
+        skip_small_reviews(rd)
+        r = fe.evaluate(rd)
+        expect(not failed_ids(r), "skipping review for small low-risk tasks is correct (got %s)" % failed_ids(r))
+
+        print("skipped checks")
+        repo, rd, base = build(os.path.join(tmp, "skipreason"))
+        edit_json(rd, "tasks/T1/verdict.json", lambda d: d["checks"].update(lint="skipped (no linter configured)"))
+        r = fe.evaluate(rd)
+        expect(not failed_ids(r), "a skipped check with a stated reason is accepted (got %s)" % failed_ids(r))
+        edit_json(rd, "tasks/T1/verdict.json", lambda d: d["checks"].update(done="skipped (could not run)"))
+        r = fe.evaluate(rd)
+        expect("verify.done_ran" in failed_ids(r) and "verify.consistent" not in failed_ids(r),
+               "a skipped definition-of-done check still fails, even with a reason")
 
         print("older run with a single reviewer and no route events")
         repo, rd, base = build(os.path.join(tmp, "legacy"), legacy=True)

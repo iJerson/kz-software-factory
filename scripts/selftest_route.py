@@ -86,6 +86,24 @@ def main():
     expect("ui" in r["skipped"] and "backend" in r["reasons"],
            "a skipped reviewer says why, and a spawned one says why")
 
+    print("skipping review for small low-risk changes")
+    small = [
+        ("small normal-risk backend change is skipped", dict(files=["src/Foo.java"], risk="normal", lines=12, skip_below=30), []),
+        ("exactly at the threshold is reviewed", dict(files=["src/Foo.java"], risk="normal", lines=30, skip_below=30), ["backend"]),
+        ("a large change is reviewed", dict(files=["src/Foo.java"], risk="normal", lines=200, skip_below=30), ["backend"]),
+        ("high risk is never skipped", dict(files=["src/Foo.java"], risk="high", lines=3, skip_below=30), ["backend", "security"]),
+        ("a small change with a security trigger is still reviewed", dict(files=["src/auth/Login.java"], risk="normal", lines=3, skip_below=30), ["backend", "security"]),
+        ("a small change with a risky pattern is still reviewed", dict(files=["src/Repo.java"], added_text='"SELECT * FROM t WHERE id=" + id', risk="normal", lines=3, skip_below=30), ["backend", "security"]),
+        ("skip_below 0 never skips", dict(files=["src/Foo.java"], risk="normal", lines=1, skip_below=0), ["backend"]),
+        ("unknown size never skips", dict(files=["src/Foo.java"], risk="normal", lines=None, skip_below=30), ["backend"]),
+        ("small UI change is skipped", dict(files=["web/index.html"], risk="normal", lines=5, skip_below=30), []),
+    ]
+    for desc, kw, want in small:
+        got = rr.route(kw.pop("files"), kw.pop("added_text", ""), **kw)["reviewers"]
+        expect(got == want, "%-58s -> %s%s" % (desc, got, "" if got == want else "  (wanted %s)" % want))
+    expect("small low-risk" in rr.route(["src/Foo.java"], "", "normal", 5, 30)["skipped"]["all"],
+           "a skipped review says why")
+
     print("git end to end, including --since for retries")
     tmp = tempfile.mkdtemp(prefix="route-selftest-")
     try:
@@ -117,6 +135,18 @@ def main():
                "added SQL concatenation is read from the real diff and triggers security")
         out = cli(repo, base, "task", "--risk", "high")
         expect("security" in out["reviewers"], "--risk high triggers security")
+        tip = sh(repo, "rev-parse", "HEAD")
+        write(repo, "src/Tiny.java", "class Tiny {}\n")
+        sh(repo, "commit", "-q", "-m", "tiny")
+        out = cli(repo, base, "task", "--since", tip, "--skip-below", "30")
+        expect(out["reviewers"] == [] and out["lines"] == 1,
+               "a one-line retry diff is skipped with --skip-below 30 (got %s, %s lines)" % (out["reviewers"], out["lines"]))
+        out = cli(repo, base, "task", "--since", tip)
+        expect(out["reviewers"] == ["backend"], "the same one-line diff is reviewed without --skip-below")
+        write(repo, "src/Big.java", "".join("int v%d = %d;\n" % (i, i) for i in range(60)))
+        sh(repo, "commit", "-q", "-m", "big")
+        out = cli(repo, base, "task", "--skip-below", "30")
+        expect("backend" in out["reviewers"], "a large real diff is reviewed even with --skip-below 30")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
