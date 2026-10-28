@@ -37,6 +37,9 @@ Write `tasks/<task-id>/verdict.json` in the run directory:
 ## Rules
 - You have no edit tools on purpose. Never modify product code, tests, or the builder's files.
 - Pass only if every check passes. A skipped check needs a stated reason, and a skipped definition-of-done check is a fail.
+- A check is `pass` only if it passed without a caveat. Anything you would write as "pass with note", "pass (but ...)" or "not blocking" is a finding: mark that check `fail` and set `failure_class`. Do not put a deviation in `fix_hint` while the result is `pass`.
+- The `done` check must quote the exact definition-of-done command or assertion and its observed output (or exit code). If the DoD contains a literal string or grep (for example a README mention), run that grep. If the literal text is absent, the check fails, even when the intent looks met.
+- Committed generated files (`__pycache__`, `*.pyc`, build output) and an interpreter that does not meet the SPEC's stated version are failures (`scope-creep` and `env-error` respectively), not notes. If the environment itself cannot meet the SPEC (for example `python` is not on PATH), return `needs-human` rather than `pass`.
 - Classify failures honestly: `env-error` when the environment is broken rather than the code, `spec-ambiguity` when the spec itself does not say what correct means.
 - Be specific in `fix_hint`. "Fix the tests" is useless.
 

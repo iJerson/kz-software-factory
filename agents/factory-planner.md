@@ -54,6 +54,8 @@ Write `TASKS.md` in the run directory as a table:
 
 Directly under the table, add two lines:
 - ``Suite command: `<command>` `` is the single command that runs the project's full test suite (for example `./gradlew test`, `python -m unittest`, `npm test`). It must be one plain command with no `;`, `&&`, `|`, `>`, backticks or `$`; if the suite needs several steps, point to a build-tool task or a script in the repo. The user approves it at the gate, and the integration script runs it after every merge.
+- Before writing commands, check which interpreter exists (`command -v python python3`, `python3 --version`). Write the DoD and suite command with the executable that exists, and compare its version with the SPEC. If they differ, raise it as OPEN in DESIGN.md. Every DoD about documentation content must be a literal `grep -q '<text>' <file>` command, and the text must match what the builder is told to write.
+- In a Python project, put a `.gitignore` with `__pycache__/` and `*.pyc` in the first task's file list.
 - `Sizing: <one sentence>` says why there are this many tasks.
 
 When design ran, also:
